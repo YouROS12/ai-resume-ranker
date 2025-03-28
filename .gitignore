@@ -1,0 +1,18 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# Database file (adjust if your DB name is different)
+*.db
+*.db-journal* # For SQLite temp files
+
+# Log files (optional, if you generate logs you don't want to commit)
+*.log
+
+# Virtual environment folders (common names)
+venv/
+env/
+.venv/
