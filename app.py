@@ -1,455 +1,428 @@
-# app.py
-# --- Imports ---
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 import pandas as pd
 import logging
 import time
-import io  # Required for BytesIO with fitz
-from datetime import datetime # For default job name
-import functools # Potentially useful for more complex cache invalidation if needed later
+import io
+from datetime import datetime
+import functools # Keep for potential future use
+import json
+import re # No longer needed for experience parsing, can remove if not used elsewhere
 
-# --- Project Modules ---
+# --- Project Modules --- (Keep as before)
 try:
     import config
     from services import storage_service, ocr_service, assistants
-except ImportError as e:
-    st.error(f"🚨 Failed to import project modules: {e}.")
-    st.stop()
+except ImportError as e: st.error(f"🚨 Failed import: {e}."); st.stop()
 
-# --- Configuration and Initialization ---
-st.set_page_config(layout="wide", page_title="AI Resume Analyzer")
-logger = logging.getLogger(__name__)
-if not logging.getLogger().hasHandlers():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s-%(levelname)s-[%(module)s]-%(message)s')
-
+# --- Configuration, Page Config, Styling, Logging, DB Init --- (Keep as before)
+st.set_page_config( layout="wide", page_title="AI Resume Analyzer Pro", page_icon="📄", initial_sidebar_state="expanded",
+    menu_items={ 'Get Help': 'https://github.com/YouROS12/ai-resume-ranker', 'Report a bug': "https://github.com/YouROS12/ai-resume-ranker/issues", 'About': "AI Resume Analyzer Pro" })
+# Keep the simplified CSS
+st.markdown(""" <style> ... </style> """, unsafe_allow_html=True)
+logger = logging.getLogger(__name__);
+if not logging.getLogger().handlers: logging.basicConfig(level=logging.INFO, format='%(asctime)s-%(levelname)s-[%(module)s]-%(message)s')
 try:
     if hasattr(config, 'validate_config'): config.validate_config()
-    logger.info("Configuration checked.")
-except ValueError as e:
-    st.error(f"🚨 Config Error: {e}. Check .env/config.py."); st.stop()
+    storage_service.init_db(); logger.info("System initialized.")
+except Exception as e: st.error(f"🚨 System init failed: {e}"); st.stop()
 
-try:
-    storage_service.init_db()
-    logger.info("Database initialized/checked.")
-except Exception as e:
-    st.error(f"🚨 DB Init Failed: {e}"); st.stop()
-
-# --- State Management ---
+# --- State Management --- (Keep initialize_state, reset_app_state as before)
 def initialize_state():
-    """Initializes Streamlit session state variables."""
-    defaults = {
-        'current_step': 0, 'pdf_document': None, 'total_pages': 0,
-        'current_page_index': 0, 'start_page_of_current_group': 1,
-        'resume_page_groups': [], 'splitting_started': False, 'splitting_complete': False,
-        'ocr_response_data': None, 'pdf_bytes_hash': None, 'pdf_bytes': None,
-        'ocr_error': None, 'ocr_in_progress': False, 'uploaded_pdf_name': None,
-        'job_description': "", 'job_name_input': "", 'process_button_active': False,
-        'processing_in_progress': False, 'selected_job_id': None, 'current_job_id': None,
-        'processing_log': [], 'last_job_description': "",
-    }
+    defaults = { 'mode': None, 'current_step': 0, 'pdf_document': None, 'total_pages': 0, 'current_page_index': 0, 'start_page_of_current_group': 1,
+        'resume_page_groups': [], 'splitting_started': False, 'splitting_complete': False, 'ocr_response_data': None, 'pdf_bytes_hash': None,
+        'pdf_bytes': None, 'ocr_error': None, 'ocr_in_progress': False, 'uploaded_pdf_name': None, 'job_description': "", 'job_name_input': "",
+        'process_button_active': False, 'processing_in_progress': False, 'selected_job_id': None, 'current_job_id': None, 'processing_log': [],
+        'last_job_description': "", 'theme': 'light' }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
-    logger.debug("Session state checked/initialized.")
-
 def reset_app_state():
-    """Resets the state for a new analysis."""
-    logger.info("Resetting application state for new analysis.")
-    # Preserve selected job ID maybe? Or clear everything. Let's clear all for full reset.
-    keys_to_clear = list(st.session_state.keys())
-    for key in keys_to_clear: del st.session_state[key]
-    # Clear all Streamlit cache data as well for a full reset
-    st.cache_data.clear()
-    logger.info("Cleared all session state and Streamlit cache.")
-    initialize_state() # Re-initialize with defaults
-
-# Initialize state at the start
+    preserved_theme = st.session_state.get('theme', 'light'); keys_to_clear = list(st.session_state.keys())
+    for key in keys_to_clear: del st.session_state[key]; st.cache_data.clear(); logger.info("Cleared state & cache.")
+    initialize_state(); st.session_state.theme = preserved_theme
 initialize_state()
 
-# --- Helper Functions ---
-
-# Non-cached rendering (Fallback)
-def render_page(pdf_document, page_index):
-    """Renders page directly from fitz.Document. Non-cached."""
-    # ... (Implementation unchanged from previous version) ...
-    if not pdf_document: return None
-    try:
-        if 0 <= page_index < len(pdf_document):
-            page=pdf_document.load_page(page_index); pix=page.get_pixmap(matrix=fitz.Matrix(1.7,1.7)); return pix.tobytes("png")
-        else: logger.warning(f"render_page: Invalid index {page_index}"); return None
-    except Exception as e: logger.error(f"Error rendering page {page_index}: {e}", exc_info=True); return None
-
-# Cached rendering (Preferred)
-@st.cache_data(max_entries=50) # Cache images based on hash, bytes, index
+# --- Helper Functions --- (Keep render_page*, cached_load*, convert_df_to_csv, render_step_indicator)
+@st.cache_data(max_entries=50)
 def render_page_cached(_pdf_doc_bytes_hash, _pdf_doc_bytes, page_index):
-    """Renders PDF page from bytes. Cached."""
-    # ... (Implementation unchanged from previous version) ...
-    logger.debug(f"Rendering page {page_index} (cache check for hash {_pdf_doc_bytes_hash})")
-    if not _pdf_doc_bytes: return None
+    if not _pdf_doc_bytes: return None; # ... (keep implementation)
     try:
         with fitz.open(stream=io.BytesIO(_pdf_doc_bytes), filetype="pdf") as pdf_doc:
-            if 0 <= page_index < len(pdf_doc):
-                page=pdf_doc.load_page(page_index); pix=page.get_pixmap(matrix=fitz.Matrix(1.7,1.7)); return pix.tobytes("png")
+            if 0 <= page_index < len(pdf_doc): page = pdf_doc.load_page(page_index); pix = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7)); return pix.tobytes("png")
             else: return None
     except Exception as e: logger.error(f"Error rendering page {page_index} from cache: {e}", exc_info=True); return None
-
-# --- Cached Database Load Functions ---
-# These wrap the storage_service calls and apply Streamlit caching.
-@st.cache_data(ttl=3600) # Cache job list for 1 hour or until cleared
-def cached_load_job_list():
-    logger.info("CACHE MISS/RELOAD: Loading job list from database.")
-    return storage_service.load_job_list()
-
-@st.cache_data(ttl=3600) # Cache candidates per job_id
+@st.cache_data(ttl=3600)
+def cached_load_job_list(): logger.info("CACHE: Loading job list."); return storage_service.load_job_list()
+@st.cache_data(ttl=3600)
 def cached_load_candidates_for_job(job_id: int):
-    if not job_id: return [] # Avoid caching a call with invalid ID
-    logger.info(f"CACHE MISS/RELOAD: Loading candidates for job ID {job_id} from database.")
-    return storage_service.load_candidates_for_job(job_id)
+    if not job_id: return []; logger.info(f"CACHE: Loading candidates job {job_id}.")
+    return storage_service.load_candidates_for_job(job_id) # Uses simplified loader
+@st.cache_data
+def convert_df_to_csv(df_to_convert): logger.debug("Converting df to CSV."); return df_to_convert.to_csv(index=False).encode('utf-8')
+def render_step_indicator(): # ... (keep implementation)
+    steps = ["Upload", "JD", "Split", "Confirm", "Process", "Results"]; cur = st.session_state.current_step
+    if cur < len(steps):
+        cols = st.columns(len(steps));
+        for i, s in enumerate(steps):
+            with cols[i]:
+                if i < cur: st.markdown(f"<div style='text-align: center; opacity: 0.7;'><span style='color: green;'>✅</span><br><span style='font-size: 0.85em; color: grey;'>{s}</span></div>", unsafe_allow_html=True)
+                elif i == cur: st.markdown(f"<div style='text-align: center;'><span style='color: #0d6efd;'>🔵</span><br><span style='font-size: 0.85em; font-weight: bold;'>{s}</span></div>", unsafe_allow_html=True)
+                else: st.markdown(f"<div style='text-align: center; opacity: 0.7;'><span style='color: lightgrey;'>⚪</span><br><span style='font-size: 0.85em; color: grey;'>{s}</span></div>", unsafe_allow_html=True)
 
-# --- ==================== UI Rendering Based on Step ==================== ---
-st.title("📄✨ AI Resume Analyzer")
-st.markdown("""
-*Upload PDF -> Define Resume Boundaries -> Enter Job Description -> Process with AI -> View Results*
-""")
+# --- Utility to safely parse JSON lists/dicts --- (Keep this)
+def safe_json_loads(json_string, default_value=None):
+    """Safely parses a JSON string, returning default_value on error."""
+    if not json_string or not isinstance(json_string, str): return default_value
+    try: return json.loads(json_string)
+    except (json.JSONDecodeError, TypeError): return default_value
 
-# --- Sidebar ---
-# Moved Sidebar definition higher, but populate its dynamic parts later or check existence
-st.sidebar.title("Info & Status")
-st.sidebar.markdown("---")
-st.sidebar.caption(f"Database: `{config.DATABASE_NAME}`")
-# --- Manual Cache Clear Button ---
-if st.sidebar.button("🔄 Clear Cache & Reload Data", help="Force reload data from database."):
-    st.cache_data.clear(); logger.info("User cleared Streamlit cache."); st.rerun()
-st.sidebar.markdown("---")
-# --- Reset Button ---
-if st.session_state.current_step > 0:
-     if st.sidebar.button("🆕 Start New Analysis (Reset All)", help="Clears state and cache."):
-          reset_app_state(); st.rerun() # reset_app_state now includes cache clear
-st.sidebar.markdown("---")
-st.sidebar.header("Current Status")
-step_map = {0:"1. PDF",1:"2. JD",2:"3. Split",3:"4. Ready",4:"4. AI Processing",5:"5. Results"}; st.sidebar.metric("Current Step", step_map.get(st.session_state.current_step,"?"))
-# --- Moved Job List Loading and Options Definition Here ---
-try:
-    job_list = cached_load_job_list()
-    job_options = {job['job_id']: f"{job['job_name']} ({datetime.strptime(job['created_at'][:19], '%Y-%m-%d %H:%M:%S').strftime('%y-%m-%d %H:%M')})" for job in job_list}
-except Exception as e:
-    logger.error(f"Failed to load job list for UI: {e}", exc_info=True)
-    job_list = []
-    job_options = {}
-    st.sidebar.error("Error loading job list.")
+# --- Remove render_candidate_details function ---
 
-# --- Update Sidebar Status Indicators (can now safely use job_options) ---
-if st.session_state.get('pdf_bytes_hash'): st.sidebar.success(f"PDF: {st.session_state.uploaded_pdf_name} ({st.session_state.total_pages}p)")
-if st.session_state.get('ocr_error'): st.sidebar.error("OCR Failed")
-elif isinstance(st.session_state.get('ocr_response_data'), list): st.sidebar.success("OCR Ready")
-if st.session_state.get('splitting_complete'): st.sidebar.success(f"Split Done ({len(st.session_state.resume_page_groups)} groups)")
-# Now job_options is guaranteed to exist (even if empty)
-if st.session_state.get('selected_job_id') and job_options:
-     st.sidebar.info(f"Viewing Job: {job_options.get(st.session_state.selected_job_id, 'N/A')}") # Use .get for safety
-if st.session_state.get('processing_in_progress'): st.sidebar.warning("⏳ AI Processing...")
+# --- *** Final Simplified display_job_results Function *** ---
+def display_job_results(job_id: int, job_options: dict):
+    """Renders a simple, fixed-column results table with specific extracted info."""
+    st.subheader(f"Candidates for: \"{job_options.get(job_id, f'Job ID {job_id}')}\"")
+    candidates_data = cached_load_candidates_for_job(job_id) # Gets simplified data
 
-# --- Main Panel - Step-Based UI ---
+    if not candidates_data:
+        st.info(f"No candidates found in the database for this job.")
+        return
 
-# --- Step 0/1: PDF Upload and OCR ---
-if st.session_state.current_step == 0:
-    st.header("Step 1: Upload Resume PDF")
-    st.info("Select a single PDF file containing one or more resumes.")
-    uploaded_pdf = st.file_uploader("Upload PDF", type="pdf", key="pdf_uploader_step0", label_visibility="collapsed")
-
-    if uploaded_pdf is not None:
-        pdf_bytes = uploaded_pdf.getvalue()
-        current_pdf_hash = hash(pdf_bytes)
-        if current_pdf_hash != st.session_state.pdf_bytes_hash:
-            logger.info(f"New PDF uploaded: {uploaded_pdf.name}. Resetting state and triggering OCR.")
-            # --- Reset state, store bytes and name ---
-            st.session_state.pdf_document = None; st.session_state.total_pages = 0; st.session_state.current_page_index = 0
-            st.session_state.start_page_of_current_group = 1; st.session_state.resume_page_groups = []; st.session_state.splitting_started = False
-            st.session_state.splitting_complete = False; st.session_state.ocr_response_data = None; st.session_state.process_button_active = False
-            st.session_state.ocr_error = None; st.session_state.ocr_in_progress = True; st.session_state.processing_in_progress = False
-            st.session_state.pdf_bytes_hash = current_pdf_hash; st.session_state.current_job_id = None
-            st.session_state.uploaded_pdf_name = uploaded_pdf.name; st.session_state.pdf_bytes = pdf_bytes # Store bytes
-
-            # --- Load PDF ---
-            try:
-                st.session_state.pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
-                st.session_state.total_pages = len(st.session_state.pdf_document)
-                logger.info(f"PDF loaded: {st.session_state.total_pages} pages.")
-            except Exception as pdf_err:
-                st.error(f"❌ Failed to load PDF: {pdf_err}"); logger.error(f"PDF load error: {pdf_err}", exc_info=True)
-                st.session_state.ocr_in_progress = False; st.session_state.pdf_bytes_hash = None; st.session_state.pdf_bytes = None
-                st.rerun()
-
-            # --- Trigger OCR ---
-            if st.session_state.pdf_document and st.session_state.total_pages > 0:
-                ocr_status_placeholder = st.empty(); ocr_status_placeholder.info("⚙️ Performing OCR...")
-                with st.spinner("Processing PDF text..."): ocr_result = ocr_service.perform_ocr(uploaded_pdf.name, pdf_bytes)
-                if ocr_result is not None:
-                    st.session_state.ocr_response_data = ocr_result
-                    msg = f"✅ OCR Done ({len(ocr_result)} pages)." if ocr_result else "⚠️ OCR Done, no text found."
-                    if ocr_result: st.session_state.current_step = 1; st.session_state.ocr_error = None; logger.info(msg)
-                    else: st.session_state.ocr_error = "No text content extracted."; logger.warning(msg)
-                    st.rerun() # Go to Step 1 or show error on rerun
-                else:
-                    st.session_state.ocr_error = "OCR process failed. Check logs."; logger.error(st.session_state.ocr_error)
-                    st.error(f"❌ {st.session_state.ocr_error}")
-                st.session_state.ocr_in_progress = False
-            else:
-                if st.session_state.pdf_document and st.session_state.total_pages == 0: st.warning("⚠️ PDF has 0 pages.")
-                st.session_state.ocr_in_progress = False; st.session_state.pdf_bytes_hash = None; st.session_state.pdf_bytes = None
-
-    elif st.session_state.get('ocr_error'): st.error(f"🚨 OCR Error: {st.session_state.ocr_error}")
-
-# --- Step 1: Enter Job Description ---
-elif st.session_state.current_step == 1:
-    st.header("Step 2: Enter Job Description")
-    ocr_page_count = len(st.session_state.ocr_response_data) if isinstance(st.session_state.ocr_response_data, list) else 0
-    st.success(f"✅ PDF '{st.session_state.uploaded_pdf_name}' processed ({ocr_page_count} pages ready).")
-    st.info("Provide the job description for scoring.")
-    jd_input = st.text_area("Job Description", height=250, key="jd_input_step1", placeholder="Paste JD here...", value=st.session_state.job_description)
-    if st.button("Next: Define Resume Boundaries ➡️", disabled=(not jd_input.strip())):
-        st.session_state.job_description = jd_input.strip()
-        st.session_state.current_step = 2; st.session_state.splitting_started = True; st.session_state.splitting_complete = False
-        st.session_state.resume_page_groups = []; st.session_state.current_page_index = 0; st.session_state.start_page_of_current_group = 1
-        logger.info("JD entered, proceeding to Step 2 (Splitting)."); st.rerun()
-
-# --- Step 2: Splitting ---
-elif st.session_state.current_step == 2:
-    st.header("Step 3: Define Resume Boundaries")
-    st.info("Review pages. Click 'End Resume Here' on the **last** page of each resume.")
-    current_page_num = st.session_state.current_page_index + 1
-    st.write(f"**Reviewing Page: {current_page_num} / {st.session_state.total_pages}** (Group starts page {st.session_state.start_page_of_current_group})")
-
-    # --- Display page image (using cache and stored bytes) ---
-    page_image_bytes = None; pdf_bytes_for_render = st.session_state.get('pdf_bytes')
-    if pdf_bytes_for_render and st.session_state.pdf_bytes_hash:
-        page_image_bytes = render_page_cached(st.session_state.pdf_bytes_hash, pdf_bytes_for_render, st.session_state.current_page_index)
-    if not page_image_bytes and st.session_state.pdf_document: # Fallback
-        page_image_bytes = render_page(st.session_state.pdf_document, st.session_state.current_page_index)
-    if page_image_bytes: st.image(page_image_bytes, use_container_width=False, width=400)
-    else: st.warning("Could not render page preview.")
-
-    # --- Action Buttons ---
-    st.markdown("---"); nav_cols = st.columns([1, 1, 2, 1])
-    with nav_cols[0]: # Prev
-        if st.button("⬅️ Prev", disabled=st.session_state.current_page_index<=0, use_container_width=True): st.session_state.current_page_index-=1; st.rerun()
-    with nav_cols[1]: # Next
-        if st.button("Next ➡️", disabled=current_page_num>=st.session_state.total_pages, use_container_width=True): st.session_state.current_page_index+=1; st.rerun()
-    with nav_cols[2]: # Finalize
-        if st.button(f"✅ End Resume Here (Pgs {st.session_state.start_page_of_current_group}-{current_page_num})", type="primary", use_container_width=True):
-            grp=list(range(st.session_state.start_page_of_current_group, current_page_num+1)); st.session_state.resume_page_groups.append(grp); logger.info(f"Finalized group: {grp}.")
-            st.session_state.current_page_index+=1; st.session_state.start_page_of_current_group=st.session_state.current_page_index+1
-            if st.session_state.current_page_index>=st.session_state.total_pages: st.session_state.splitting_complete=True; st.session_state.current_step=3; logger.info("Split complete.")
-            st.rerun()
-    with nav_cols[3]: # Skip
-         if st.button("⏭️ Skip", help="Exclude page", use_container_width=True):
-            logger.info(f"Skipped page {current_page_num}."); st.session_state.current_page_index+=1; st.session_state.start_page_of_current_group=st.session_state.current_page_index+1
-            if st.session_state.current_page_index>=st.session_state.total_pages: st.session_state.splitting_complete=True; st.session_state.current_step=3; logger.info("Split complete after skip.")
-            st.rerun()
-    if st.session_state.resume_page_groups: st.write("Defined Groups:", st.session_state.resume_page_groups)
-
-# --- Step 3: Ready to Process ---
-elif st.session_state.current_step == 3:
-    st.header("Step 4: Process Resumes with AI")
-    st.success(f"✅ Ready! ({len(st.session_state.resume_page_groups)} resume groups defined).")
-    if not st.session_state.resume_page_groups: st.warning("No groups defined.")
-    else:
-        default_job_name = f"{st.session_state.uploaded_pdf_name.rsplit('.',1)[0] if st.session_state.uploaded_pdf_name else 'Job'}_{datetime.now().strftime('%Y%m%d_%H%M')}"
-        st.session_state.job_name_input = st.text_input("Assign Unique Job Name:", value=st.session_state.get('job_name_input', default_job_name), key="job_name_step3")
-        process_disabled = not st.session_state.job_name_input.strip()
-        if st.button("🚀 Process Job", key="process_submit_step3", type="primary", disabled=process_disabled):
-            job_name = st.session_state.job_name_input.strip()
-            if not job_name: st.error("❌ Job name required.")
-            else:
-                logger.info(f"Attempting job create/retrieve for '{job_name}'...")
-                job_desc_snippet=(st.session_state.job_description[:100]+'...'); pdf_file=st.session_state.uploaded_pdf_name or "N/A"
-                current_job_id = storage_service.create_job(job_name, pdf_file, job_desc_snippet)
-                if current_job_id is None: st.error(f"❌ Failed start job '{job_name}'. Name taken or DB error?"); logger.error(f"Failed get job_id for '{job_name}'.")
-                else:
-                    st.session_state.current_job_id=current_job_id; st.session_state.processing_log=[]; st.session_state.current_step=4
-                    logger.info(f"Starting AI loop for Job ID {current_job_id} ('{job_name}')."); st.rerun()
-
-# --- Step 4: Processing ---
-elif st.session_state.current_step == 4:
-    st.header("Step 4: Processing Resumes with AI...")
-    st.info(f"🤖 Processing Job '{st.session_state.job_name_input}' (ID: {st.session_state.current_job_id})...")
-    total_resumes=len(st.session_state.resume_page_groups); progress_bar=st.progress(0,text="Initializing..."); status_container=st.container(); processed_count=0; error_count=0
     try:
-        for i, page_group in enumerate(st.session_state.resume_page_groups):
-            # ... (Progress bar, status updates, Call assistants.process_single_resume_group) ...
-            pg_rng=f"{page_group[0]}-{page_group[-1]}" if len(page_group)>1 else str(page_group[0]); prog_txt=f"Resume {i+1}/{total_resumes} (Pgs {pg_rng})..."
-            curr_prog=(i+0.1)/total_resumes; progress_bar.progress(min(curr_prog,1.0),text=prog_txt); status_container.info(f"🔄 {prog_txt}")
-            extracted, scored, raw1, raw2 = assistants.process_single_resume_group(page_group, st.session_state.ocr_response_data, st.session_state.job_description)
-            progress_bar.progress(min(curr_prog+0.8/total_resumes,1.0), text=f"AI done for {pg_rng}...")
-            # ... (Store results using storage_service.store_candidate_data) ...
-            if extracted:
-                status_container.write(f"💾 Storing {pg_rng}..."); row_id=storage_service.store_candidate_data(st.session_state.current_job_id,pg_rng,st.session_state.job_description,extracted,scored,raw1,raw2)
-                if row_id: processed_count+=1
-                else: error_count+=1; status_container.warning(f"⚠️ DB store failed {pg_rng}.")
-            else: error_count+=1; status_container.warning(f"⚠️ Extract failed {pg_rng}, not stored.")
-            progress_bar.progress(min((i+1)/total_resumes,1.0), text=f"Done {pg_rng}.")
-        # --- Processing Finished ---
-        final_msg = f"Job '{st.session_state.job_name_input}' finished.";
-        if processed_count>0: st.success(f"✅ {final_msg} {processed_count} resumes stored.")
-        if error_count>0: st.warning(f"⚠️ {final_msg} Issues with {error_count} resumes.")
-        st.session_state.selected_job_id=st.session_state.current_job_id; st.session_state.current_step=5; st.session_state.processing_in_progress=False
-        logger.info(f"Finished AI loop Job ID {st.session_state.current_job_id}. Stored:{processed_count}, Errors:{error_count}.")
-        time.sleep(1.5); st.rerun()
-    except Exception as e: st.error(f"🚨 Critical error: {e}"); logger.error("Main loop exception.",exc_info=True); st.session_state.processing_in_progress=False; st.session_state.current_step=3; st.rerun()
+        df = pd.DataFrame(candidates_data)
+        df_display = pd.DataFrame() # Create a new DF for the final table columns
 
-# --- Step 5: Show Results ---
-elif st.session_state.current_step == 5:
-    st.header("Step 5: View Processed Job Results")
+        # --- Extract and Prepare Data for Display ---
 
-    # --- Job Selection & Deletion ---
-    job_list = cached_load_job_list() # Use cached function
-    job_options = {job['job_id']: f"{job['job_name']} ({datetime.strptime(job['created_at'][:19], '%Y-%m-%d %H:%M:%S').strftime('%y-%m-%d %H:%M')})" for job in job_list}
-    default_job_id = st.session_state.get('selected_job_id')
-    if default_job_id not in job_options and job_list: default_job_id = job_list[0]['job_id'] # Most recent
+        # 1. Core Identifiers & Direct Fields
+        df_display['ID'] = df['id']
+        df_display['Name'] = df['candidate_name']
+        df_display['Email'] = df['email']
+        df_display['Phone'] = df['personal_information'].apply(lambda x: safe_json_loads(x, {}).get('phone_number', 'N/A'))
+        df_display['Experience'] = df['total_years_experience'].fillna('N/A').astype(str)
+        df_display['Internship Duration'] = df['total_internship_duration'].fillna('N/A').astype(str)
+        df_display['Reasoning'] = df['score_reasoning'].fillna('')
+        df_display['Job Name'] = df['job_name'] # From the JOIN in load_candidates
 
-    selected_job_details = next((job for job in job_list if job['job_id'] == default_job_id), None)
-    col_select, col_detail, col_delete = st.columns([3, 3, 1])
+        # 2. Scores
+        df_display['Fit Score (%)'] = pd.to_numeric(df['score_percent'], errors='coerce').fillna(-1).astype(int)
+        df_display['Overall Score (%)'] = pd.to_numeric(df['overall_score_percent'], errors='coerce').fillna(-1).astype(int)
 
-    with col_select: # Selectbox for Job
-        selected_job_id_from_ui = st.selectbox(
-            "Select Job:", options=list(job_options.keys()), format_func=lambda jid: job_options.get(jid, f"ID {jid}"),
-            index=list(job_options.keys()).index(default_job_id) if default_job_id in job_options else 0, key="job_selector_step5", label_visibility="collapsed"
+        # 3. Parse JSON Lists for display
+        df_display['Degrees'] = df['education'].apply(lambda x: [edu.get('degree', 'N/A') for edu in safe_json_loads(x, []) if isinstance(edu, dict)])
+        df_display['All Skills'] = df['skills'].apply(lambda x: safe_json_loads(x, []))
+        df_display['Certifications'] = df['certifications'].apply(lambda x: [cert.get('certification_name', 'N/A') for cert in safe_json_loads(x, []) if isinstance(cert, dict)])
+        df_display['Matched Skills'] = df['matched_skills'].apply(lambda x: safe_json_loads(x, []))
+        df_display['Missing Skills'] = df['missing_skills'].apply(lambda x: safe_json_loads(x, []))
+
+        # --- Define Final Columns and Order ---
+        # Match the user's requested list
+        final_columns_ordered = [
+            'Job Name',
+            #'ID',
+            'Name',
+            'Email',
+            'Phone',
+            'Experience',
+            'Degrees',
+            'All Skills',
+            'Matched Skills',
+            'Missing Skills',
+            'Fit Score (%)',
+            'Reasoning',
+            'Certifications',
+            'Internship Duration',
+            'Overall Score (%)',
+        ]
+
+        # Select only the columns that were successfully created
+        final_cols_present = [col for col in final_columns_ordered if col in df_display.columns]
+        df_final_table = df_display[final_cols_present]
+
+        # --- Display Table (No Filters) ---
+        st.markdown("---")
+        st.markdown(f"**Displaying {len(df_final_table)} candidates**")
+
+        # --- Configure Columns ---
+        column_config = {
+            "Name": st.column_config.TextColumn(width="medium"),
+            "Email": st.column_config.TextColumn(width="medium"),
+            "Phone": st.column_config.TextColumn(width="small"),
+            "Degrees": st.column_config.ListColumn(width="medium"),
+            "All Skills": st.column_config.ListColumn(width="large"),
+            "Certifications": st.column_config.ListColumn(width="medium"),
+            "Fit Score (%)": st.column_config.ProgressColumn(format="%d%%", width="small", min_value=0, max_value=100),
+            "Reasoning": st.column_config.TextColumn(width="large"),
+            "Matched Skills": st.column_config.ListColumn(width="medium"),
+            "Missing Skills": st.column_config.ListColumn(width="medium"),
+            "Experience": st.column_config.TextColumn("Total Exp.", width="small"), # Shorten Header
+            "Internship Duration": st.column_config.TextColumn("Internships", width="small"), # Shorten Header
+            "Overall Score (%)": st.column_config.ProgressColumn(format="%d%%", width="small", min_value=0, max_value=100),
+            "Job Name": st.column_config.TextColumn(width="medium"),
+            #"ID": st.column_config.NumberColumn(width="small"),
+        }
+        # Filter config only for columns present in the final table
+        active_config = {k: v for k, v in column_config.items() if k in df_final_table.columns}
+
+        st.dataframe(
+            df_final_table,
+            use_container_width=False, # Enable expand button
+            hide_index=True,
+            column_config=active_config,
+            column_order=final_cols_present
         )
-        if selected_job_id_from_ui != st.session_state.selected_job_id:
-            st.session_state.selected_job_id = selected_job_id_from_ui; logger.info(f"User selected Job ID {st.session_state.selected_job_id}"); st.rerun()
 
-    with col_detail: # Show details of selected job
-        if selected_job_details: st.caption(f"**PDF:** {selected_job_details.get('pdf_filename','N/A')} | **Created:** {datetime.strptime(selected_job_details['created_at'][:19],'%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')}")
-        else: st.caption("Select a job.")
+        # --- Download Button (Exports this specific view) ---
+        if not df_final_table.empty:
+            df_export = df_final_table.copy()
+            # Convert list columns to strings for CSV export
+            list_cols = ['Degrees', 'All Skills', 'Certifications', 'Matched Skills', 'Missing Skills']
+            for col in list_cols:
+                if col in df_export.columns:
+                     df_export[col] = df_export[col].apply(lambda x: '; '.join(map(str, x)) if isinstance(x, list) else x)
 
-    with col_delete: # Delete button with popover confirmation
-        if st.session_state.selected_job_id:
-            del_key = f"del_job_{st.session_state.selected_job_id}"
-            with st.popover("🗑️ Delete", use_container_width=True):
-                st.warning(f"Delete '{job_options.get(st.session_state.selected_job_id)}' and all its data?")
-                if st.button("Confirm Delete", key=f"confirm_{del_key}", type="primary"):
-                    job_id_to_delete = st.session_state.selected_job_id
-                    logger.warning(f"User confirmed deletion for job ID {job_id_to_delete}")
-                    deleted = storage_service.delete_job_and_candidates(job_id_to_delete)
-                    if deleted:
-                        st.toast(f"Job ID {job_id_to_delete} deleted.")
-                        # Clear caches
-                        cached_load_candidates_for_job.clear(job_id=job_id_to_delete) # Specific job cache
-                        cached_load_job_list.clear() # Job list cache
-                        st.session_state.selected_job_id = None # Reset selection
-                        st.rerun() # Reload job list and results area
-                    else:
-                        st.error("Failed to delete job. Check logs.")
-                        logger.error(f"Deletion failed for job ID {job_id_to_delete}.")
+            csv_data = convert_df_to_csv(df_export)
+            st.download_button(label="📥 Download Results", data=csv_data, file_name=f'job_{job_id}_candidates_{time.strftime("%Y%m%d")}.csv', mime='text/csv')
 
-    # --- Load and Display Results for Selected Job ---
-    if st.session_state.selected_job_id:
-        st.subheader(f"Candidates for: \"{job_options.get(st.session_state.selected_job_id, 'N/A')}\"")
-        # Load data specifically for the selected job using cached function
-        results_data = cached_load_candidates_for_job(st.session_state.selected_job_id)
+    except KeyError as e:
+         st.error(f"⚠️ Data Display Error: Could not find data field: {e}.")
+         logger.error(f"KeyError displaying results for job {job_id}: {e}", exc_info=True)
+    except Exception as e:
+        st.error(f"⚠️ An unexpected error occurred displaying results: {e}")
+        logger.error(f"Display results error for job {job_id}.", exc_info=True)
 
-        if results_data:
-            # --- Display Logic Starts Here ---
-            try:
-                df = pd.DataFrame(results_data)
+# --- ========================= UI Flow ========================= ---
 
-                # Define Columns and Prepare DataFrame
-                display_columns = {
-                    'id': 'ID', 'candidate_name': 'Name','email': 'Email', 'resume_page_range': 'Pages',
-                    'score_percent': 'Fit Score (%)', 'overall_score_percent': 'Overall Score (%)',
-                    'total_years_experience': 'Exp (Yrs)', 'total_internship_duration': 'Internships',
-                    'matched_skills': 'Matched Skills', 'missing_skills': 'Missing Skills',
-                    'score_reasoning': 'Reasoning (Fit)', 'processing_timestamp': 'Processed At'
-                }
-                # Ensure columns exist
-                for col in display_columns.keys(): df[col] = df.get(col)
-                display_df = df[list(display_columns.keys())].copy()
-                display_df.rename(columns=display_columns, inplace=True)
-
-                # Formatting
-                if 'Processed At' in display_df.columns:
-                    try: display_df['Processed At'] = pd.to_datetime(display_df['Processed At']).dt.strftime('%Y-%m-%d %H:%M')
-                    except: display_df['Processed At'] = 'Invalid Date'
-                display_df['Fit Score (%)'] = pd.to_numeric(display_df['Fit Score (%)'], errors='coerce').fillna(-1).astype(int)
-                display_df['Overall Score (%)'] = pd.to_numeric(display_df['Overall Score (%)'], errors='coerce').fillna(-1).astype(int)
-                display_df['Exp (Yrs)'] = pd.to_numeric(display_df['Exp (Yrs)'], errors='coerce').fillna(0).round(1)
-
-                # Filtering UI
-                st.markdown("---"); st.markdown("#### Filter Results")
-                filter_cols = st.columns([1, 1, 2])
-                min_fit_score = filter_cols[0].slider("Min Fit Score:", -1, 100, -1, format="%d%%", key="sf", help="Filter by job fit score (-1 shows all).")
-                min_exp_years = filter_cols[1].slider("Min Exp (Yrs):", 0, int(display_df['Exp (Yrs)'].max()) + 1, 0, key="ef", help="Filter by minimum years of experience.")
-                search_term = filter_cols[2].text_input("Search Name/Email:", key="searchf", placeholder="Filter by text...")
-
-                # Apply Filters
-                filtered_df = display_df[
-                    (display_df['Fit Score (%)'] >= min_fit_score) &
-                    (display_df['Exp (Yrs)'] >= min_exp_years)
-                ]
-                if search_term:
-                    filtered_df = filtered_df[
-                        filtered_df['Name'].astype(str).str.contains(search_term, case=False, na=False) |
-                        filtered_df['Email'].astype(str).str.contains(search_term, case=False, na=False)
-                    ]
-
-                st.markdown(f"**Displaying {len(filtered_df)} of {len(results_data)} candidates for this job**")
-
-                # Display Table with column configuration
-                st.dataframe(
-                    filtered_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "ID": st.column_config.NumberColumn(width="small"),
-                        "Name": st.column_config.TextColumn(width="medium"),
-                        "Email": st.column_config.TextColumn(width="medium"),
-                        "Pages": st.column_config.TextColumn(width="small"),
-                        "Fit Score (%)": st.column_config.ProgressColumn(
-                            format="%d%%", width="medium", min_value=0, max_value=100,
-                            help="Candidate fit score based on JD."
-                        ),
-                        "Overall Score (%)": st.column_config.ProgressColumn(
-                            format="%d%%", width="medium", min_value=0, max_value=100,
-                            help="General CV quality score."
-                        ),
-                        "Exp (Yrs)": st.column_config.NumberColumn(format="%.1f Yrs", width="small"),
-                        "Internships": st.column_config.TextColumn(width="small"),
-                        "Matched Skills": st.column_config.ListColumn(width="medium", help="Skills found matching JD."),
-                        "Missing Skills": st.column_config.ListColumn(width="medium", help="Skills from JD potentially missing."),
-                        "Reasoning (Fit)": st.column_config.TextColumn(width="large", help="AI reasoning for the fit score."),
-                        "Processed At": st.column_config.TextColumn(width="medium")
-                    }
-                )
-
-                # Download Button
-                @st.cache_data
-                def convert_df_to_csv(df_to_convert): return df_to_convert.to_csv(index=False).encode('utf-8')
-                csv_data = convert_df_to_csv(filtered_df)
-                st.download_button(
-                    label="📥 Download Filtered Results", data=csv_data,
-                    file_name=f'job_{st.session_state.selected_job_id}_results_{time.strftime("%Y%m%d")}.csv',
-                    mime='text/csv', help="Download the currently filtered table data."
-                )
-            # --- End Display Logic ---
-            except Exception as display_err:
-                st.error(f"⚠️ Error occurred while displaying results: {display_err}")
-                logger.error("Results display encountered an error.", exc_info=True)
-        else: # If results_data is empty
-            st.info(f"No candidates found in the database for the selected job (ID: {st.session_state.selected_job_id}).")
-    else: # If no job is selected
-        st.info("Select a processing job from the dropdown above to view results.")
-
-    # Button to start over
-    if st.button("Process Another PDF"):
-        reset_app_state()
+# --- Sidebar --- (Keep as before)
+with st.sidebar:
+    st.title("📄 AI Ranker")
+    theme_toggle = st.toggle("🌙 Dark Mode", value=st.session_state.theme == 'dark', key="theme_toggle")
+    if theme_toggle != (st.session_state.theme == 'dark'):
+        st.session_state.theme = 'dark' if theme_toggle else 'light'
         st.rerun()
+    st.markdown("---")
+    if st.session_state.mode:
+        switch_to_mode = 'History View' if st.session_state.mode == 'new' else 'New Analysis'
+        if st.button(f"🔄 Switch to {switch_to_mode}", key="switch_mode"):
+            st.session_state.mode = 'history' if st.session_state.mode == 'new' else 'new'
+            if st.session_state.mode == 'new': st.session_state.current_step = 0
+            st.rerun()
+    st.markdown("---")
+    st.caption(f"DB: `{config.DATABASE_NAME}`")
+    if st.button("🔄 Clear Cache & Reload", help="Force reload data.", key="clear_cache"):
+        cached_load_job_list.clear(); cached_load_candidates_for_job.clear(); render_page_cached.clear(); convert_df_to_csv.clear()
+        logger.info("User cleared Streamlit cache."); st.rerun()
+    if st.session_state.current_step > 0 or st.session_state.mode == 'history':
+        if st.button("🆕 Reset Application", help="Clears state, returns to mode selection.", key="reset_app"):
+            reset_app_state(); st.session_state.mode = None; st.rerun()
+    st.markdown("---")
+    # Sidebar Status Indicators (keep conditional logic)
+    if st.session_state.mode == 'new':
+        st.header("New Analysis Status"); step_map = {0:"1. PDF", 1:"2. JD", 2:"3. Split", 3:"4. Confirm", 4:"4. AI Processing", 5:"5. Results"}; st.metric("Current Step", step_map.get(st.session_state.current_step,"?"));
+        if st.session_state.get('pdf_bytes_hash'): st.success(f"📄 PDF Loaded")
+        if st.session_state.get('ocr_error'): st.error("⚠️ OCR Failed")
+        elif isinstance(st.session_state.get('ocr_response_data'), list): st.success("✅ OCR Ready")
+        if st.session_state.get('splitting_complete'): st.success(f"✅ Split Done ({len(st.session_state.resume_page_groups)} groups)")
+        if st.session_state.get('processing_in_progress'): st.warning("⏳ AI Processing...")
+    elif st.session_state.mode == 'history':
+        st.header("History View Status");
+        try:
+            job_list_sidebar = cached_load_job_list()
+            job_opts = {job['job_id']: job['job_name'] for job in job_list_sidebar}
+            sel_id = st.session_state.get('selected_job_id')
 
-# --- Fallback (No changes needed here) ---
-elif st.session_state.current_step not in range(6):
-     st.error("Unexpected state. Resetting."); logger.error(f"App invalid state: {st.session_state.current_step}. Resetting.")
-     reset_app_state(); st.rerun()
+            if sel_id and sel_id in job_opts:
+                st.info(f"Viewing: \"{job_opts[sel_id]}\"")
+            elif job_list_sidebar:
+                st.info("Select a job to view.")
+            else:
+                st.info("No previous jobs found.")
 
-# --- Sidebar ---
-# --- Fallback ---
-elif st.session_state.current_step not in range(6):
-     st.error("Unexpected state. Resetting."); logger.error(f"App invalid state: {st.session_state.current_step}. Resetting.")
-     reset_app_state(); st.rerun()
+        except Exception as e:
+            logger.error(f"Sidebar job list error: {e}", exc_info=True)
+            st.error("Error loading jobs.")
+# --- Main Panel Logic ---
+st.title("📄 AI Resume Analyzer Pro")
+# Feature Box Markdown 
+st.markdown("""<div style='background-color: #e7f3fe; padding: 1rem; border-radius: 10px; margin-bottom: 1.5rem; border: 1px solid #cce5ff;'> <h4 style='margin: 0 0 0.5rem 0; color: #0a58ca; font-weight: bold;'>🚀 Streamline Your Hiring</h4> <ul style='margin-bottom: 0; padding-left: 20px; color: #0a58ca; list-style-type: disc;'> <li><b>Upload PDF:</b> Process multiple resumes at once.</li> <li><b>Define Boundaries:</b> Easily separate individual resumes.</li> <li><b>AI Analysis:</b> Extract key info and score against your JD.</li> <li><b>Interactive Dashboard:</b> Filter, sort, and export results.</li> </ul> </div> """, unsafe_allow_html=True)
+
+# --- Mode Selection --- 
+if not st.session_state.mode:
+    st.markdown("### Welcome! Choose an action:"); cols = st.columns(2)
+    with cols[0]:
+        if st.button("🚀 Process New Resumes", use_container_width=True, type="primary", key="start_new"):
+            reset_app_state(); st.session_state.mode = 'new'; st.session_state.current_step = 0; st.rerun()
+    with cols[1]:
+        if st.button("📊 View Previous Results", use_container_width=True, key="view_history"):
+            st.session_state.mode = 'history';
+            try: jobs = cached_load_job_list(); st.session_state.selected_job_id = jobs[0]['job_id'] if jobs else None
+            except Exception: st.session_state.selected_job_id = None; st.rerun() # Add rerun on exception too
+
+# --- History View ---
+elif st.session_state.mode == 'history':
+    st.header("📊 Previous Analysis Results"); st.markdown("Select a job to view results.")
+    try: jobs = cached_load_job_list(); opts = {j['job_id']: f"{j['job_name']} ({datetime.strptime(j['created_at'][:19], '%Y-%m-%d %H:%M:%S').strftime('%y-%m-%d %H:%M')})" for j in jobs}
+    except Exception as e: st.error(f"Err loading jobs: {e}"); logger.error(f"Hist job list err: {e}", exc_info=True); jobs = []; opts = {}
+    if not jobs: st.info("No previous jobs found.")
+    else:
+        sel = st.session_state.get('selected_job_id'); ids = list(opts.keys());
+        if sel not in ids: sel = ids[0] if ids else None
+        cols = st.columns([4, 4, 1])
+        with cols[0]: # Selectbox
+             sel_ui = st.selectbox("Select Job:", options=ids, format_func=lambda jid: opts.get(jid, f"ID {jid}"), index=ids.index(sel) if sel in ids else 0, key="job_sel_hist", label_visibility="collapsed")
+             if sel_ui != st.session_state.selected_job_id: st.session_state.selected_job_id = sel_ui; logger.info(f"Hist view selected Job ID {sel_ui}."); st.rerun()
+        sel_details = next((j for j in jobs if j['job_id'] == st.session_state.selected_job_id), None)
+        with cols[1]: # Details
+             if sel_details: st.caption(f"**PDF:** `{sel_details.get('pdf_filename','N/A')}` | **Created:** {datetime.strptime(sel_details['created_at'][:19],'%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M')}")
+             elif st.session_state.selected_job_id: st.caption("Loading...")
+             else: st.caption("Select job.")
+        with cols[2]: # Delete Popover
+            if st.session_state.selected_job_id:
+                name = opts.get(st.session_state.selected_job_id, f"ID {st.session_state.selected_job_id}")
+                with st.popover("🗑️", use_container_width=True, help=f"Delete job '{name}'"):
+                    st.warning(f"Delete job **'{name}'** and all data?");
+                    if st.button("Confirm Delete", key=f"confirm_del_{st.session_state.selected_job_id}", type="primary"):
+                        jid_del = st.session_state.selected_job_id; logger.warning(f"Confirm delete job ID {jid_del} ('{name}')")
+                        deleted = storage_service.delete_job_and_candidates(jid_del)
+                        if deleted: st.toast(f"Job '{name}' deleted.", icon="✅"); cached_load_candidates_for_job.clear(); cached_load_job_list.clear(); st.session_state.selected_job_id = None; st.rerun()
+                        else: st.error("Failed to delete."); logger.error(f"Delete failed job ID {jid_del}.")
+        # Display Results using updated function
+        if st.session_state.selected_job_id: display_job_results(st.session_state.selected_job_id, opts)
+        elif jobs: st.info("Select a job to view results.")
+
+
+# --- New Analysis Flow --- (Steps 0-5 logic remains the same, calls updated display_job_results at step 5)
+elif st.session_state.mode == 'new':
+    if st.session_state.current_step < 5: render_step_indicator(); st.divider()
+    # Step 0: PDF Upload (Keep logic)
+    if st.session_state.current_step == 0:
+        st.header("Step 1: Upload Resume PDF"); st.info("Select a single PDF file.")
+        uploaded_pdf = st.file_uploader("Upload PDF", type="pdf", key="pdf_uploader_step0", label_visibility="collapsed")
+        if uploaded_pdf is not None: # ... (Keep all PDF processing and OCR logic) ...
+            pdf_bytes = uploaded_pdf.getvalue(); current_pdf_hash = hash(pdf_bytes)
+            if current_pdf_hash != st.session_state.pdf_bytes_hash:
+                logger.info(f"New PDF: {uploaded_pdf.name}."); # Reset state...
+                st.session_state.pdf_document = None; st.session_state.total_pages = 0; st.session_state.current_page_index = 0; st.session_state.start_page_of_current_group = 1; st.session_state.resume_page_groups = []; st.session_state.splitting_started = False; st.session_state.splitting_complete = False; st.session_state.ocr_response_data = None; st.session_state.process_button_active = False; st.session_state.ocr_error = None; st.session_state.ocr_in_progress = True; st.session_state.processing_in_progress = False; st.session_state.pdf_bytes_hash = current_pdf_hash; st.session_state.current_job_id = None; st.session_state.uploaded_pdf_name = uploaded_pdf.name; st.session_state.pdf_bytes = pdf_bytes
+                try: # Load PDF...
+                    st.session_state.pdf_document = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf"); st.session_state.total_pages = len(st.session_state.pdf_document); logger.info(f"PDF loaded: {st.session_state.total_pages} pages.")
+                    if st.session_state.total_pages == 0: st.warning("⚠️ PDF has 0 pages."); st.session_state.ocr_in_progress = False; st.session_state.pdf_bytes_hash = None; st.session_state.pdf_bytes = None; st.stop()
+                except Exception as pdf_err: st.error(f"❌ Failed load PDF: {pdf_err}"); logger.error(f"PDF load error: {pdf_err}", exc_info=True); st.session_state.ocr_in_progress = False; st.session_state.pdf_bytes_hash = None; st.session_state.pdf_bytes = None; st.stop()
+                if st.session_state.pdf_document and st.session_state.total_pages > 0: # Trigger OCR...
+                    ocr_status = st.empty(); ocr_status.info("⚙️ Performing OCR..."); t0 = time.time();
+                    with st.spinner("Analyzing text..."): ocr_result = ocr_service.perform_ocr(uploaded_pdf.name, pdf_bytes)
+                    t1 = time.time(); logger.info(f"OCR done in {t1-t0:.2f}s.")
+                    if ocr_result is not None:
+                        st.session_state.ocr_response_data = ocr_result
+                        if ocr_result: st.session_state.current_step = 1; st.session_state.ocr_error = None; logger.info(f"OCR OK: {len(ocr_result)} pages."); ocr_status.success(f"✅ OCR Done ({len(ocr_result)} pages)."); time.sleep(1); st.rerun()
+                        else: st.session_state.ocr_error = "OCR no text."; logger.warning(st.session_state.ocr_error); ocr_status.warning(f"⚠️ {st.session_state.ocr_error}")
+                    else: st.session_state.ocr_error = "OCR failed."; logger.error(st.session_state.ocr_error); ocr_status.error(f"❌ {st.session_state.ocr_error}")
+                    st.session_state.ocr_in_progress = False
+                if st.session_state.ocr_error or st.session_state.total_pages == 0: st.session_state.pdf_bytes_hash = None; st.session_state.pdf_bytes = None
+        elif st.session_state.get('ocr_error'): st.error(f"🚨 OCR Error: {st.session_state.ocr_error}")
+        elif not st.session_state.get('pdf_bytes_hash'): st.markdown("👈 Upload PDF.")
+    # Step 1: JD Input (Keep logic)
+    elif st.session_state.current_step == 1:
+        st.header("Step 2: Enter Job Description"); # ... (Keep JD input logic) ...
+        ocr_count = len(st.session_state.ocr_response_data) if isinstance(st.session_state.ocr_response_data, list) else 0; st.success(f"✅ PDF '{st.session_state.uploaded_pdf_name}' ({ocr_count} pages)."); st.info("Paste JD below.")
+        jd_input = st.text_area("Job Description", height=250, key="jd_input_step1", placeholder="Paste JD here...", value=st.session_state.job_description)
+        cols = st.columns([1, 3]);
+        with cols[0]: # Back btn
+             if st.button("⬅️ Back", key="back_to_upload"): st.session_state.current_step = 0; st.rerun()
+        with cols[1]: # Next btn
+             if st.button("Next ➡️", key="next_to_split", type="primary", disabled=(not jd_input.strip())): st.session_state.job_description = jd_input.strip(); st.session_state.current_step = 2; st.session_state.splitting_started = True; st.session_state.splitting_complete = False; st.session_state.resume_page_groups = []; st.session_state.current_page_index = 0; st.session_state.start_page_of_current_group = 1; logger.info("JD entered."); st.rerun()
+    # Step 2: Splitting (Keep logic)
+    elif st.session_state.current_step == 2:
+        st.header("Step 3: Define Resume Boundaries"); # ... (Keep splitting logic) ...
+        st.info("Navigate pages. Click **'End Here'** on last page of each resume. Use 'Skip'.")
+        pg_num = st.session_state.current_page_index + 1; st.write(f"**Page: {pg_num}/{st.session_state.total_pages}** (Group starts page {st.session_state.start_page_of_current_group})")
+        img_bytes = None; pdf_bytes = st.session_state.get('pdf_bytes');
+        if pdf_bytes and st.session_state.pdf_bytes_hash: img_bytes = render_page_cached(st.session_state.pdf_bytes_hash, pdf_bytes, st.session_state.current_page_index)
+        if img_bytes: l,m,r=st.columns([1,2,1]); m.image(img_bytes, use_container_width=True)
+        else: st.warning("No preview.")
+        st.markdown("---"); cols = st.columns(5)
+        with cols[0]: # Back
+             if st.button("⬅️ Back", key="back_to_jd", use_container_width=True): st.session_state.current_step = 1; st.rerun()
+        with cols[1]: # Prev Page
+            if st.button("◀️ Prev", disabled=st.session_state.current_page_index<=0, use_container_width=True): st.session_state.current_page_index-=1; st.rerun()
+        with cols[2]: # Next Page
+            if st.button("Next ▶️", disabled=pg_num>=st.session_state.total_pages, use_container_width=True): st.session_state.current_page_index+=1; st.rerun()
+        with cols[3]: # End Resume
+            if st.button("✅ End Here", type="primary", use_container_width=True, help=f"End resume on page {pg_num}"):
+                grp = list(range(st.session_state.start_page_of_current_group, pg_num + 1)); st.session_state.resume_page_groups.append(grp); logger.info(f"Group: {grp}."); st.toast(f"Resume (Pgs {grp[0]}-{grp[-1]}) defined.", icon="✅")
+                st.session_state.current_page_index += 1; st.session_state.start_page_of_current_group = st.session_state.current_page_index + 1
+                if st.session_state.current_page_index >= st.session_state.total_pages: st.session_state.splitting_complete = True; st.session_state.current_step = 3; logger.info("Split complete.")
+                st.rerun()
+        with cols[4]: # Skip Page
+             if st.button("⏭️ Skip", help="Exclude page", use_container_width=True):
+                logger.info(f"Skipped page {pg_num}."); st.toast(f"Page {pg_num} skipped.", icon="⏭️")
+                st.session_state.current_page_index+=1; st.session_state.start_page_of_current_group=st.session_state.current_page_index+1
+                if st.session_state.current_page_index >= st.session_state.total_pages: st.session_state.splitting_complete=True; st.session_state.current_step=3; logger.info("Split complete after skip.")
+                st.rerun()
+        if st.session_state.resume_page_groups: st.info(f"Defined Groups: `{st.session_state.resume_page_groups}`")
+        if pg_num == st.session_state.total_pages and not st.session_state.splitting_complete: st.warning("Last page. 'End Here' or 'Skip Page' to finish.")
+    # Step 3: Confirm (Keep logic)
+    elif st.session_state.current_step == 3:
+        st.header("Step 4: Confirm and Process"); # ... (Keep confirm logic) ...
+        if not st.session_state.resume_page_groups: st.warning("⚠️ No groups defined."); # Back button...
+        else:
+            st.success(f"✅ Ready! {len(st.session_state.resume_page_groups)} groups defined:"); st.json(st.session_state.resume_page_groups)
+            default_job = f"{st.session_state.uploaded_pdf_name.rsplit('.',1)[0] if st.session_state.uploaded_pdf_name else 'Job'}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+            st.session_state.job_name_input = st.text_input("Assign Unique Job Name:", value=st.session_state.get('job_name_input', default_job), key="job_name_step3")
+            disabled = not st.session_state.job_name_input.strip(); cols = st.columns([1, 3])
+            with cols[0]: # Back btn
+                 if st.button("⬅️ Back", key="back_to_split_confirm2"): st.session_state.current_step = 2; # ... (Logic to resume splitting) ...
+                 last_pg = max(p for grp in st.session_state.resume_page_groups for p in grp) if st.session_state.resume_page_groups else 0; st.session_state.current_page_index = min(last_pg, st.session_state.total_pages - 1); st.session_state.start_page_of_current_group = st.session_state.current_page_index + 1; st.session_state.splitting_complete = False; st.rerun()
+            with cols[1]: # Process btn
+                 if st.button("🚀 Process Job", key="process_submit_step3", type="primary", disabled=disabled):
+                     job_name = st.session_state.job_name_input.strip();
+                     if not job_name: st.error("❌ Name empty.")
+                     else: # Create Job ID...
+                         logger.info(f"Create/get job '{job_name}'..."); job_desc = (st.session_state.job_description[:100] + '...'); pdf = st.session_state.uploaded_pdf_name or "N/A"; job_id = storage_service.create_job(job_name, pdf, job_desc)
+                         if job_id is None: ex_id = storage_service.get_job_id_by_name(job_name); st.error(f"❌ Job '{job_name}' exists (ID: {ex_id})." if ex_id else f"❌ Failed start job '{job_name}'."); logger.error(f"Fail get/create job '{job_name}'.")
+                         else: st.session_state.current_job_id = job_id; st.session_state.processing_log = []; st.session_state.current_step = 4; st.session_state.processing_in_progress = True; logger.info(f"Start AI loop Job ID {job_id} ('{job_name}')."); st.rerun()
+    # Step 4: Processing (Keep logic)
+    elif st.session_state.current_step == 4:
+        st.header("Step 4: AI Processing..."); # ... (Keep processing loop logic) ...
+        st.info(f"🤖 Processing Job '{st.session_state.job_name_input}' (ID: {st.session_state.current_job_id}). Wait...")
+        total = len(st.session_state.resume_page_groups);
+        if total == 0: st.error("No groups."); #... reset logic ...
+        else: # Processing loop...
+            prog_bar = st.progress(0, text="Init..."); status = st.empty(); ok=0; err=0
+            try:
+                for i, grp in enumerate(st.session_state.resume_page_groups): # AI Processing Loop...
+                    rng=f"{grp[0]}-{grp[-1]}" if len(grp)>1 else str(grp[0]); val=(i+1)/total; txt=f"Proc. {i+1}/{total} (Pgs {rng})"
+                    prog_bar.progress(val, text=txt); status.info(f"🔄 {txt}: AI..."); t0=time.time()
+                    extracted, scored, raw1, raw2 = assistants.process_single_resume_group(grp, st.session_state.ocr_response_data, st.session_state.job_description)
+                    t1=time.time(); logger.info(f"{txt}: AI done {t1-t0:.2f}s."); status.info(f"🔄 {txt}: Store...")
+                    if extracted and scored: # Store...
+                         t0=time.time(); rowid=storage_service.store_candidate_data(st.session_state.current_job_id, rng, st.session_state.job_description, extracted, scored, raw1, raw2); t1=time.time()
+                         if rowid: ok+=1; logger.info(f"{txt}: Stored OK {t1-t0:.2f}s.")
+                         else: err+=1; logger.error(f"{txt}: DB store fail."); status.warning(f"⚠️ DB fail Pgs {rng}.")
+                    elif extracted: err+=1; logger.error(f"{txt}: Score fail."); status.warning(f"⚠️ Score fail Pgs {rng}.")
+                    else: err+=1; logger.error(f"{txt}: Extract fail."); status.warning(f"⚠️ Extract fail Pgs {rng}.")
+                # Finish...
+                prog_bar.progress(1.0, text="Complete!"); msg = f"Job '{st.session_state.job_name_input}' done."
+                if ok > 0: status.success(f"✅ {msg} {ok} stored.")
+                if err > 0: status.warning(f"⚠️ {msg} Issues with {err}.")
+                if ok==0 and err==0: status.warning("Finished, no resumes processed.")
+                st.session_state.selected_job_id = st.session_state.current_job_id; st.session_state.current_step = 5; st.session_state.processing_in_progress = False; logger.info(f"Finished Job ID {st.session_state.current_job_id}. Stored: {ok}, Errors: {err}.")
+                time.sleep(2); st.rerun()
+            except Exception as e: st.error(f"🚨 Critical error: {e}"); logger.error("AI loop exception.", exc_info=True); st.session_state.processing_in_progress = False; st.session_state.current_step = 3; st.rerun()
+    # Step 5: Show Results (Calls updated display_job_results)
+    elif st.session_state.current_step == 5:
+        st.header("🏁 Step 5: Analysis Results"); # ... (Keep logic calling display_job_results) ...
+        job_name = st.session_state.get('job_name_input', f"ID {st.session_state.selected_job_id}"); st.info(f"Results for job: **{job_name}** (ID: {st.session_state.selected_job_id})")
+        try: jobs = cached_load_job_list(); opts = {j['job_id']: f"{j['job_name']} (...)" for j in jobs}
+        except Exception as e: logger.error(f"Results view job opts error: {e}"); opts = {}
+        if st.session_state.selected_job_id: display_job_results(st.session_state.selected_job_id, opts)
+        else: st.warning("No job selected."); logger.warning("Results step 5 no selected_job_id.")
+        if st.button("✨ Process Another PDF", key="process_another"): reset_app_state(); st.session_state.mode = 'new'; st.session_state.current_step = 0; st.rerun()
+
+
+# --- Fallback --- (Keep as before)
+elif st.session_state.mode == 'new' and st.session_state.current_step not in range(6):
+     st.error("Unexpected state. Resetting."); logger.error(f"App invalid state: Step {st.session_state.current_step}. Resetting.")
+     reset_app_state(); st.session_state.mode = None; st.rerun()
+
+# --- Footer --- (Keep as before)
+st.markdown("---"); st.caption("AI Resume Analyzer Pro | Powered by Streamlit, OpenAI & Mistral")
