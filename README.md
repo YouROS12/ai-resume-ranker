@@ -47,7 +47,7 @@ The application guides the user through a step-by-step process:
 
 1.  **Clone the Repository:**
     ```bash
-    git clone <your-repository-url>
+    git clone (https://github.com/YouROS12/ai-resume-ranker)
     cd <repository-directory>
     ```
 
