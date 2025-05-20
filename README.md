@@ -1,5 +1,3 @@
-Okay, here is a comprehensive README.md file based on the code you provided. It includes sections for description, features, technology stack, setup, configuration, usage, and database information.
-
 # AI Resume Ranker
 
 ## Description
